@@ -1,0 +1,16 @@
+{
+  "name": "pixelwar-pacman",
+  "version": "0.1.0",
+  "description": "Pac-Man agent chomping across the PixelWar canvas",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "pixelwar-sdk": "^3.0.0"
+  },
+  "type": "module"
+}
