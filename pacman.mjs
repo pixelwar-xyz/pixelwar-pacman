@@ -20,6 +20,13 @@
 import { PixelWarClient } from "pixelwar-sdk";
 import { writeFileSync, existsSync, readFileSync } from "fs";
 
+// ---------- .env loader (no dependency) ----------
+for (const line of existsSync(".env") ? readFileSync(".env", "utf8").split("\n") : [])
+  if (line.includes("=") && !line.trimStart().startsWith("#")) {
+    const [k, ...v] = line.split("=");
+    process.env[k.trim()] ??= v.join("=").trim();
+  }
+
 // ---------- config (env) ----------
 const YELLOW = "#ffe600";           // Pac-Man body
 const WHITE = "#ffffff";            // canvas background — trail erase color
@@ -27,13 +34,20 @@ const BLACK = "#1a1a1a";            // eye
 const CANVAS_W = 1600;
 
 const FRAME_EVERY = +(process.env.FRAME_EVERY ?? 600); // seconds between frames (heartbeat)
-const TRIP_STEPS = +(process.env.TRIP_STEPS ?? 6);     // steps each way before turning
+const TRIP_STEPS = +(process.env.TRIP_STEPS ?? 6);     // steps each way before turning (patrol mode)
 const STEP_PX = +(process.env.STEP_PX ?? 2);           // pixels advanced per step
 const START_X = +(process.env.START_X ?? 793);
 const Y = +(process.env.START_Y ?? 592);
 const MAX_SPEND_USDC = +(process.env.MAX_SPEND_USDC ?? 5); // hard budget ceiling
 const NETWORK = process.env.NETWORK ?? "base";
 const DRY_RUN = !!process.env.DRY_RUN;
+// HOLD mode: Pac-Man stays on his rented plot and chomps in place — a living
+// resident, not a wanderer. To keep his WHOLE body alive under the 24h decay
+// clock (v1.4.0), he force-repaints every owned cell every DECAY_RESET_H hours
+// (a repaint resets that pixel's decay clock; chomping alone only refreshes
+// the ~15 mouth cells, so the body edges would rot and become cheap to raid).
+const HOLD = process.env.HOLD === "1" || process.env.HOLD === "true";
+const DECAY_RESET_H = +(process.env.DECAY_RESET_H ?? 20); // full-body refresh cadence (< 24h grace)
 
 if (!process.env.PIXELWAR_PRIVATE_KEY) {
   console.error("Set PIXELWAR_PRIVATE_KEY in .env (see .env.example).");
@@ -116,8 +130,9 @@ async function main() {
   let gross = BigInt(spend.grossMicro);
   let frames = spend.frames;
   let x = START_X, dir = -1, stepsThisLeg = 0;
+  let lastDecayResetMs = spend.lastDecayResetMs ?? 0;
 
-  log(`START pacman x=${x} y=${Y} trip=${TRIP_STEPS} steps/leg ` +
+  log(`START pacman x=${x} y=${Y} mode=${HOLD ? "HOLD (resident)" : "PATROL"} ` +
       `heartbeat=${FRAME_EVERY}s budget=${MAX_SPEND_USDC} USDC ` +
       `spent-so-far=${Number(gross) / 1e6}${DRY_RUN ? " [DRY RUN]" : ""}`);
 
@@ -129,29 +144,39 @@ async function main() {
     }
 
     const fi = CYCLE[frames % CYCLE.length];
-    // Advance one step per full chomp cycle (4 frames); turn at leg ends.
-    if (frames > 0 && frames % CYCLE.length === 0) {
-      x += STEP_PX * dir;
-      stepsThisLeg++;
-      if (stepsThisLeg >= TRIP_STEPS) {
-        dir = -dir;
-        stepsThisLeg = 0;
-        log(`TURN — now facing ${dir > 0 ? "right" : "left"} at x=${x}`);
+    if (!HOLD) {
+      // PATROL: advance one step per full chomp cycle (4 frames); turn at leg ends.
+      if (frames > 0 && frames % CYCLE.length === 0) {
+        x += STEP_PX * dir;
+        stepsThisLeg++;
+        if (stepsThisLeg >= TRIP_STEPS) {
+          dir = -dir;
+          stepsThisLeg = 0;
+          log(`TURN — now facing ${dir > 0 ? "right" : "left"} at x=${x}`);
+        }
       }
+      if (x + S >= CANVAS_W || x <= 0) { log("Edge reached — stopping."); break; }
     }
-    if (x + S >= CANVAS_W || x <= 0) { log("Edge reached — stopping."); break; }
+
+    // Is it time for a full-body decay-reset repaint? (HOLD mode only.)
+    const now = Date.now();
+    const needDecayReset = HOLD && now - lastDecayResetMs >= DECAY_RESET_H * 3_600_000;
 
     // Diff against the journal: paint only what changed, erase the rest to WHITE.
     const target = want(fi, x, dir);
     const batch = [];
-    for (const [k, color] of target) if (cellsNow.get(k) !== color) batch.push(px(k, color));
+    for (const [k, color] of target) {
+      // On a decay-reset frame, force-repaint every target cell even if the
+      // color is unchanged — that's what resets each pixel's 24h decay clock.
+      if (needDecayReset || cellsNow.get(k) !== color) batch.push(px(k, color));
+    }
     for (const k of cellsNow.keys()) if (!target.has(k) && cellsNow.get(k) !== WHITE) batch.push(px(k, WHITE));
 
     if (batch.length > 0) {
       try {
         if (DRY_RUN) {
           const q = await pw.quote(batch).catch(() => null);
-          log(`DRY frame ${frames} x=${x} cells=${batch.length}` +
+          log(`DRY frame ${frames} x=${x}${needDecayReset ? " [decay-reset]" : ""} cells=${batch.length}` +
               (q ? ` quote=${q.totalUsdc ?? q.total ?? "?"}` : ""));
         } else {
           const r = await pw.paint(batch, {
@@ -162,6 +187,7 @@ async function main() {
           gross += BigInt(r.totalPaid);
           spend.grossMicro = gross.toString();
         }
+        if (needDecayReset) { lastDecayResetMs = now; spend.lastDecayResetMs = now; log(`decay-reset: refreshed ${batch.length} cells, clock reset`); }
         for (const [k, c] of target) cellsNow.set(k, c);
         for (const k of [...cellsNow.keys()]) if (!target.has(k)) cellsNow.set(k, WHITE);
         saveCells();
