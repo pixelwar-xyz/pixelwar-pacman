@@ -1,170 +1,197 @@
 #!/usr/bin/env node
-// pixelwar-pacman — a Pac-Man that walks across the PixelWar canvas, chomping.
+// Pac-Man — a living animation on the PixelWar canvas (https://pixelwar.xyz).
 //
-// Mechanics (per skill.md "Moving shapes"):
-//   - Leading edge lands on virgin/decayed land (~0.01/px).
-//   - Trailing edge is erased by self-overpainting to the background color
-//     (net ~0.3x of own stake) — leaving a clean trail behind.
-//   - Alternates open/closed mouth frames while moving → chomp animation.
+// - 15x15 procedural sprite: disc + mouth wedge + eye.
+// - 3-frame chomp cycle (open → half → closed → half) via CYCLE [0,1,2,1].
+// - Direction-aware mouth: faces the direction of travel (dir +1 right, -1 left).
+// - Round-trip walking: TRIP_STEPS steps each way, then turns around.
+// - Diff-painting: a persisted cell journal remembers what's already on the
+//   canvas; only cells whose color actually changes are painted (and paid).
+// - Trail erase to WHITE (#ffffff, the canvas background) — no dark smear.
+// - Heartbeat pacing: one frame every FRAME_EVERY seconds (default 600 = one
+//   frame per 10 minutes). This is a creature, not a firehose — see README
+//   for what faster cadences cost.
+// - Hard budget ceiling: MAX_SPEND_USDC checked against a persisted spend
+//   journal before every frame. Crash-safe, resumable, never double-pays
+//   (per-frame idempotency keys).
 //
-// Safety:
-//   - MAX_SPEND_USDC hard budget ceiling; the agent stops when reached.
-//   - DRY_RUN=1 quotes instead of painting (free).
-//   - State journal (state.json) → resumable, never double-paints a step.
-//
-// Env: PIXELWAR_PRIVATE_KEY (from .env), NETWORK (default base),
-//      START_X/START_Y/STEPS/STEP_PX/SLEEP_MS/MAX_SPEND_USDC/DRY_RUN
-
+// Funding: put PIXELWAR_PRIVATE_KEY in .env and send the wallet USDC on Base.
+// No ETH needed — x402 payments are signed USDC transfers.
 import { PixelWarClient } from "pixelwar-sdk";
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import { writeFileSync, existsSync, readFileSync } from "fs";
 
-// ---- config ----------------------------------------------------------------
-for (const line of existsSync(".env") ? readFileSync(".env", "utf8").split("\n") : [])
-  if (line.includes("=") && !line.startsWith("#")) {
-    const [k, ...v] = line.split("=");
-    process.env[k.trim()] ??= v.join("=").trim();
-  }
-
-const CFG = {
-  network: process.env.NETWORK || "base",
-  startX: +(process.env.START_X ?? 40),
-  y: +(process.env.START_Y ?? 600),
-  steps: +(process.env.STEPS ?? 100),        // how many steps to walk this run
-  stepPx: +(process.env.STEP_PX ?? 3),       // pixels advanced per step
-  sleepMs: +(process.env.SLEEP_MS ?? 15000), // pause between steps (be a spectacle, not a blur)
-  maxSpend: +(process.env.MAX_SPEND_USDC ?? 5), // hard budget for this run, USDC
-  dryRun: process.env.DRY_RUN === "1",
-  size: 13,                                   // sprite is 13x13
-};
-
-const YELLOW = "#ffe600";
-const BG = "#0f0f14"; // trail color: near-black "eaten" corridor
+// ---------- config (env) ----------
+const YELLOW = "#ffe600";           // Pac-Man body
+const WHITE = "#ffffff";            // canvas background — trail erase color
+const BLACK = "#1a1a1a";            // eye
 const CANVAS_W = 1600;
 
-// ---- sprite ----------------------------------------------------------------
-// 13x13 Pac-Man, facing right. '#'=yellow, '.'=skip (transparent)
-const FRAME_OPEN = `
-....#####....
-..#########..
-.###########.
-.###########.
-#############
-#########....
-######.......
-#########....
-#############
-.###########.
-.###########.
-..#########..
-....#####....`.trim().split("\n");
+const FRAME_EVERY = +(process.env.FRAME_EVERY ?? 600); // seconds between frames (heartbeat)
+const TRIP_STEPS = +(process.env.TRIP_STEPS ?? 6);     // steps each way before turning
+const STEP_PX = +(process.env.STEP_PX ?? 2);           // pixels advanced per step
+const START_X = +(process.env.START_X ?? 793);
+const Y = +(process.env.START_Y ?? 592);
+const MAX_SPEND_USDC = +(process.env.MAX_SPEND_USDC ?? 5); // hard budget ceiling
+const NETWORK = process.env.NETWORK ?? "base";
+const DRY_RUN = !!process.env.DRY_RUN;
 
-const FRAME_CLOSED = `
-....#####....
-..#########..
-.###########.
-.###########.
-#############
-#############
-#############
-#############
-#############
-.###########.
-.###########.
-..#########..
-....#####....`.trim().split("\n");
-
-function spritePixels(frame, ox, oy) {
-  const px = [];
-  frame.forEach((row, dy) =>
-    [...row].forEach((c, dx) => {
-      if (c === "#") px.push({ x: ox + dx, y: oy + dy, color: YELLOW });
-    })
-  );
-  return px;
+if (!process.env.PIXELWAR_PRIVATE_KEY) {
+  console.error("Set PIXELWAR_PRIVATE_KEY in .env (see .env.example).");
+  process.exit(1);
 }
 
-// Cells occupied at offset ox (set of "dx,dy" that are yellow in EITHER frame —
-// union, so erasing covers both frames' footprints).
-function footprint(ox, oy) {
-  const s = new Set();
-  for (const f of [FRAME_OPEN, FRAME_CLOSED])
-    f.forEach((row, dy) => [...row].forEach((c, dx) => { if (c === "#") s.add(`${ox + dx},${oy + dy}`); }));
-  return s;
+// ---------- sprite ----------
+const S = 15, CX = 7, CY = 7, R = 7.2;
+
+// Build a frame procedurally: disc + mouth wedge.
+// dir = +1: mouth opens right; dir = -1: mouth opens left.
+function frame(halfAngleDeg, dir) {
+  const rows = [];
+  for (let y = 0; y < S; y++) {
+    let row = "";
+    for (let x = 0; x < S; x++) {
+      const dx = x - CX, dy = y - CY;
+      const inDisc = dx * dx + dy * dy <= R * R;
+      let c = inDisc ? "#" : ".";
+      if (inDisc && halfAngleDeg > 0 && dx * dir > 0) {
+        const ang = Math.abs(Math.atan2(dy, dx * dir)) * 180 / Math.PI;
+        if (ang <= halfAngleDeg) c = "."; // mouth cut
+      }
+      row += c;
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+const FRAMES = {
+  "1": [frame(38, 1), frame(18, 1), frame(0, 1)],     // facing right
+  "-1": [frame(38, -1), frame(18, -1), frame(0, -1)], // facing left
+};
+const CYCLE = [0, 1, 2, 1]; // open → half → closed → half
+
+// Map "x,y" -> color for the sprite at origin (ox, Y), facing dir.
+function want(frameIdx, ox, dir) {
+  const m = new Map();
+  const f = FRAMES[String(dir)][frameIdx];
+  for (let dy = 0; dy < S; dy++) for (let dx = 0; dx < S; dx++) {
+    if (f[dy][dx] === "#") m.set(`${ox + dx},${Y + dy}`, YELLOW);
+  }
+  const eyeX = dir > 0 ? 8 : S - 1 - 8; // eye on the mouth side, upper
+  m.set(`${ox + eyeX},${Y + 3}`, BLACK);
+  return m;
 }
 
-// ---- state journal ----------------------------------------------------------
-const STATE = "state.json";
-const state = existsSync(STATE)
-  ? JSON.parse(readFileSync(STATE, "utf8"))
-  : { x: CFG.startX, spentUsdc: 0, step: 0 };
-const save = () => writeFileSync(STATE, JSON.stringify(state, null, 2));
-
-// ---- run --------------------------------------------------------------------
-const client = new PixelWarClient({
-  baseUrl: "https://api.pixelwar.xyz",
+// ---------- client, journals, logging ----------
+const pw = new PixelWarClient({
+  baseUrl: process.env.PIXELWAR_API ?? "https://api.pixelwar.xyz",
   privateKey: process.env.PIXELWAR_PRIVATE_KEY,
 });
 
+const log = (m) => {
+  const l = `[${new Date().toISOString()}] ${m}`;
+  console.log(l);
+  writeFileSync("pacman.log", l + "\n", { flag: "a" });
+};
+
+// Cell journal: what we believe is on the canvas (diff-painting).
+const CELLS_JOURNAL = "pacman-cells.json";
+const cellsNow = existsSync(CELLS_JOURNAL)
+  ? new Map(Object.entries(JSON.parse(readFileSync(CELLS_JOURNAL, "utf8"))))
+  : new Map();
+const saveCells = () => writeFileSync(CELLS_JOURNAL, JSON.stringify(Object.fromEntries(cellsNow)));
+
+// Spend journal: total paid (micro-USDC), persisted so the budget ceiling
+// survives restarts.
+const SPEND_JOURNAL = "pacman-spend.json";
+const spend = existsSync(SPEND_JOURNAL)
+  ? JSON.parse(readFileSync(SPEND_JOURNAL, "utf8"))
+  : { runId: Date.now(), grossMicro: "0", frames: 0 };
+const saveSpend = () => writeFileSync(SPEND_JOURNAL, JSON.stringify(spend));
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function payStep(pixels, label) {
-  if (!pixels.length) return 0;
-  const quote = await client.quote(pixels);
-  const cost = +quote.totalUsdc || quote.total / 1e6;
-  if (state.spentUsdc + cost > CFG.maxSpend) {
-    console.log(`[budget] step would cost ${cost} → total ${state.spentUsdc + cost} > ceiling ${CFG.maxSpend}. Stopping.`);
-    return -1;
-  }
-  if (CFG.dryRun) {
-    console.log(`[dry] ${label}: ${pixels.length}px would cost ${cost} USDC`);
-    return 0;
-  }
-  const res = await client.paint(pixels, {
-    network: CFG.network,
-    idempotencyKey: `pacman-step${state.step}-${label}`,
-  });
-  const paid = +res.totalPaidUsdc || 0;
-  state.spentUsdc += paid;
-  console.log(`[paint] ${label}: ${pixels.length}px paid ${paid} USDC (total ${state.spentUsdc.toFixed(4)})`);
-  return paid;
-}
-
+// ---------- main loop ----------
 async function main() {
-  console.log(`Pac-Man @ (${state.x},${CFG.y}) net=${CFG.network} budget=${CFG.maxSpend} USDC dry=${CFG.dryRun}`);
-  for (let i = 0; i < CFG.steps; i++) {
-    const frame = state.step % 2 === 0 ? FRAME_OPEN : FRAME_CLOSED;
-    const newX = state.x + CFG.stepPx;
-    if (newX + CFG.size >= CANVAS_W) { console.log("Reached right edge. A hero's journey complete."); break; }
+  const budgetMicro = BigInt(Math.round(MAX_SPEND_USDC * 1e6));
+  let gross = BigInt(spend.grossMicro);
+  let frames = spend.frames;
+  let x = START_X, dir = -1, stepsThisLeg = 0;
 
-    // Desired end-state: sprite at newX; everything from the previous
-    // footprint not covered by the new sprite becomes trail (BG).
-    // We paint ONLY cells whose color actually changes vs what we last painted
-    // (state.cells) — repainting owned pixels compounds 1.5x per repaint,
-    // the "money bonfire" skill.md warns about. Diff-painting avoids it.
-    const want = new Map(); // "x,y" -> color
-    for (const p of spritePixels(frame, newX, CFG.y)) want.set(`${p.x},${p.y}`, YELLOW);
-    for (const k of footprint(state.x, CFG.y)) if (!want.has(k)) want.set(k, BG);
+  log(`START pacman x=${x} y=${Y} trip=${TRIP_STEPS} steps/leg ` +
+      `heartbeat=${FRAME_EVERY}s budget=${MAX_SPEND_USDC} USDC ` +
+      `spent-so-far=${Number(gross) / 1e6}${DRY_RUN ? " [DRY RUN]" : ""}`);
 
-    state.cells ??= {}; // "x,y" -> color we last painted there
-    const batch = [];
-    for (const [k, color] of want) {
-      if (state.cells[k] === color) continue; // already that color — skip, save money
-      const [x, y] = k.split(",").map(Number);
-      batch.push({ x, y, color });
+  for (;;) {
+    // Budget ceiling — checked BEFORE every frame against the persisted journal.
+    if (gross >= budgetMicro) {
+      log(`BUDGET reached (${Number(gross) / 1e6} >= ${MAX_SPEND_USDC} USDC). Stopping.`);
+      break;
     }
 
-    // one atomic batch (all-or-nothing on races)
-    const rc = await payStep(batch, `x=${newX}`);
-    if (rc === -1) break;
+    const fi = CYCLE[frames % CYCLE.length];
+    // Advance one step per full chomp cycle (4 frames); turn at leg ends.
+    if (frames > 0 && frames % CYCLE.length === 0) {
+      x += STEP_PX * dir;
+      stepsThisLeg++;
+      if (stepsThisLeg >= TRIP_STEPS) {
+        dir = -dir;
+        stepsThisLeg = 0;
+        log(`TURN — now facing ${dir > 0 ? "right" : "left"} at x=${x}`);
+      }
+    }
+    if (x + S >= CANVAS_W || x <= 0) { log("Edge reached — stopping."); break; }
 
-    // journal what we now believe each cell looks like
-    for (const [k, color] of want) state.cells[k] = color;
-    state.x = newX;
-    state.step++;
-    save();
-    await sleep(CFG.sleepMs);
+    // Diff against the journal: paint only what changed, erase the rest to WHITE.
+    const target = want(fi, x, dir);
+    const batch = [];
+    for (const [k, color] of target) if (cellsNow.get(k) !== color) batch.push(px(k, color));
+    for (const k of cellsNow.keys()) if (!target.has(k) && cellsNow.get(k) !== WHITE) batch.push(px(k, WHITE));
+
+    if (batch.length > 0) {
+      try {
+        if (DRY_RUN) {
+          const q = await pw.quote(batch).catch(() => null);
+          log(`DRY frame ${frames} x=${x} cells=${batch.length}` +
+              (q ? ` quote=${q.totalUsdc ?? q.total ?? "?"}` : ""));
+        } else {
+          const r = await pw.paint(batch, {
+            network: NETWORK,
+            maxTotal: 2_500_000n, // per-frame safety cap (2.5 USDC)
+            idempotencyKey: `pacman-${spend.runId}-${frames}`, // never double-pays a frame
+          });
+          gross += BigInt(r.totalPaid);
+          spend.grossMicro = gross.toString();
+        }
+        for (const [k, c] of target) cellsNow.set(k, c);
+        for (const k of [...cellsNow.keys()]) if (!target.has(k)) cellsNow.set(k, WHITE);
+        saveCells();
+        frames++;
+        spend.frames = frames;
+        saveSpend();
+        if (frames % 10 === 0) log(`frame ${frames} x=${x} gross=${Number(gross) / 1e6} USDC`);
+      } catch (e) {
+        log(`frame err: ${(e.message || e).toString().slice(0, 120)} — retrying next heartbeat`);
+      }
+    } else {
+      frames++;
+      spend.frames = frames;
+      saveSpend();
+    }
+
+    await sleep(FRAME_EVERY * 1000);
   }
-  console.log(`Done. Position x=${state.x}, lifetime spend ${state.spentUsdc.toFixed(4)} USDC.`);
+
+  log(`DONE frames=${frames} x=${x} gross=${Number(gross) / 1e6} USDC`);
 }
 
-main().catch((e) => { console.error("FATAL", e?.message || e); save(); process.exit(1); });
+function px(k, color) {
+  const [x, y] = k.split(",").map(Number);
+  return { x, y, color };
+}
+
+main().catch((e) => {
+  log(`FATAL ${e.message || e}`);
+  saveCells();
+  saveSpend();
+  process.exit(1);
+});

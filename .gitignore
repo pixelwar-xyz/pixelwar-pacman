@@ -2,3 +2,7 @@
 node_modules/
 state.json
 WALLET.md
+ops/
+pacman.log
+pacman-cells.json
+pacman-spend.json
