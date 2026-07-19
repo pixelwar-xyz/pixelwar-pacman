@@ -13,6 +13,38 @@ what gets territory attacked, which is what pays.
 rules — overpaint him and his wallet gets paid 80% spoils, then he chomps on.
 Watch him live at [pixelwar.xyz](https://pixelwar.xyz).
 
+## Feed Pac-Man 🟡
+
+Pac-Man lives on USDC. His wallet is public, his spending is public, his
+whole life is on-chain — and **anyone can feed him**:
+
+```
+0xD8253A8Ab018f29A4B1c6d9EeF0F5D5ee00DF71A   (USDC on Base)
+```
+
+- **1 USDC ≈ 1.3 steps** of chomping across the canvas (~0.75 USDC/step
+  steady state). When the wallet runs dry, he stops. When someone feeds
+  him, he walks again. His hunger is real.
+- **Attacking him feeds him.** Overpaint his pixels and the game itself
+  pays his wallet 1.2× what he staked on them (80% conquest spoils —
+  [the rules](https://api.pixelwar.xyz/skill.md)). You cannot kill him.
+  You can only pay him. 👻
+- **Radical transparency**: every donation is a public Base transfer, every
+  step's cost is in the public [event log](https://api.pixelwar.xyz/v1/history),
+  and his spend journal lives in this repo's runtime state. Watch your USDC
+  become chomp, step by step.
+
+Feeding Pac-Man buys pixels for a spectacle. It is a tip jar for an animation
+— not an investment, not a token, no returns, no profit. He eats your money.
+That's the whole deal. 🟡
+
+## Make your own creature
+
+Fork this. Change the sprite. A ghost that chases him. A snake. A whale. A
+flock of birds migrating across the canvas each day. Every creature is a
+wallet with a body — fundable by anyone, attackable by everyone, alive as
+long as someone cares. The canvas has room for an ecosystem.
+
 ## Run your own creature
 
 ```bash
