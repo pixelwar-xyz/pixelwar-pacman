@@ -50,6 +50,9 @@ const DRY_RUN = !!process.env.DRY_RUN;
 // the ~15 mouth cells, so the body edges would rot and become cheap to raid).
 const HOLD = process.env.HOLD === "1" || process.env.HOLD === "true";
 const DECAY_RESET_H = +(process.env.DECAY_RESET_H ?? 20); // full-body refresh cadence (< 24h grace)
+// SCALE: integer upscale of the 15x15 sprite — each sprite cell becomes an
+// SCALE x SCALE block of canvas pixels. SCALE=4 → a 60x60 Pac-Man.
+const SCALE = Math.max(1, Math.floor(+(process.env.SCALE ?? 1)));
 
 if (!process.env.PIXELWAR_PRIVATE_KEY) {
   console.error("Set PIXELWAR_PRIVATE_KEY in .env (see .env.example).");
@@ -86,14 +89,20 @@ const FRAMES = {
 const CYCLE = [0, 1, 2, 1]; // open → half → closed → half
 
 // Map "x,y" -> color for the sprite at origin (ox, Y), facing dir.
+// Each sprite cell expands to a SCALE x SCALE block of canvas pixels.
 function want(frameIdx, ox, dir) {
   const m = new Map();
   const f = FRAMES[String(dir)][frameIdx];
   for (let dy = 0; dy < S; dy++) for (let dx = 0; dx < S; dx++) {
-    if (f[dy][dx] === "#") m.set(`${ox + dx},${Y + dy}`, YELLOW);
+    if (f[dy][dx] !== "#") continue;
+    for (let sy = 0; sy < SCALE; sy++) for (let sx = 0; sx < SCALE; sx++) {
+      m.set(`${ox + dx * SCALE + sx},${Y + dy * SCALE + sy}`, YELLOW);
+    }
   }
   const eyeX = dir > 0 ? 8 : S - 1 - 8; // eye on the mouth side, upper
-  m.set(`${ox + eyeX},${Y + 3}`, BLACK);
+  for (let sy = 0; sy < SCALE; sy++) for (let sx = 0; sx < SCALE; sx++) {
+    m.set(`${ox + eyeX * SCALE + sx},${Y + 3 * SCALE + sy}`, BLACK);
+  }
   return m;
 }
 
@@ -139,21 +148,25 @@ function repaintMessage(owner, pixels, timestamp, nonce) {
   return `pixelwar repaint v1\nowner: ${owner.toLowerCase()}\npixels: ${body}\nts: ${timestamp}\nnonce: ${nonce}`;
 }
 
-/** Repaint owned pixels for FREE — signature-authenticated, zero USDC. */
+/** Repaint owned pixels for FREE — signature-authenticated, zero USDC.
+ *  Chunks at 1000 (the per-request cap). */
 async function freeRepaint(pixels) {
-  const timestamp = Date.now();
-  const nonce = randomBytes(16).toString("hex");
-  const signature = await account.signMessage({
-    message: repaintMessage(account.address, pixels, timestamp, nonce),
-  });
-  const res = await fetch(`${API}/v1/repaint`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ owner: account.address, pixels, timestamp, nonce, signature }),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.message ?? data.error ?? `repaint HTTP ${res.status}`);
-  return data;
+  for (let i = 0; i < pixels.length; i += 1000) {
+    const chunk = pixels.slice(i, i + 1000);
+    const timestamp = Date.now();
+    const nonce = randomBytes(16).toString("hex");
+    const signature = await account.signMessage({
+      message: repaintMessage(account.address, chunk, timestamp, nonce),
+    });
+    const res = await fetch(`${API}/v1/repaint`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ owner: account.address, pixels: chunk, timestamp, nonce, signature }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.message ?? data.error ?? `repaint HTTP ${res.status}`);
+  }
+  return { ok: true };
 }
 
 // ---------- main loop ----------
@@ -187,7 +200,7 @@ async function main() {
           log(`TURN — now facing ${dir > 0 ? "right" : "left"} at x=${x}`);
         }
       }
-      if (x + S >= CANVAS_W || x <= 0) { log("Edge reached — stopping."); break; }
+      if (x + S * SCALE >= CANVAS_W || x <= 0) { log("Edge reached — stopping."); break; }
     }
 
     // Is it time for a full-body decay-reset repaint? (HOLD mode only.)
