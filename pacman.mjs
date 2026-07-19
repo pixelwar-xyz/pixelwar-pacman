@@ -18,6 +18,8 @@
 // Funding: put PIXELWAR_PRIVATE_KEY in .env and send the wallet USDC on Base.
 // No ETH needed — x402 payments are signed USDC transfers.
 import { PixelWarClient } from "pixelwar-sdk";
+import { privateKeyToAccount } from "viem/accounts";
+import { randomBytes } from "crypto";
 import { writeFileSync, existsSync, readFileSync } from "fs";
 
 // ---------- .env loader (no dependency) ----------
@@ -124,6 +126,36 @@ const saveSpend = () => writeFileSync(SPEND_JOURNAL, JSON.stringify(spend));
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ---------- FREE repaint (ruleset v1.5.0: own your land, animate it free) ----------
+const API = process.env.PIXELWAR_API ?? "https://api.pixelwar.xyz";
+const account = privateKeyToAccount(
+  process.env.PIXELWAR_PRIVATE_KEY.startsWith("0x")
+    ? process.env.PIXELWAR_PRIVATE_KEY
+    : `0x${process.env.PIXELWAR_PRIVATE_KEY}`,
+);
+
+function repaintMessage(owner, pixels, timestamp, nonce) {
+  const body = pixels.map((p) => `${p.x},${p.y},${p.color.toLowerCase()}`).join(";");
+  return `pixelwar repaint v1\nowner: ${owner.toLowerCase()}\npixels: ${body}\nts: ${timestamp}\nnonce: ${nonce}`;
+}
+
+/** Repaint owned pixels for FREE — signature-authenticated, zero USDC. */
+async function freeRepaint(pixels) {
+  const timestamp = Date.now();
+  const nonce = randomBytes(16).toString("hex");
+  const signature = await account.signMessage({
+    message: repaintMessage(account.address, pixels, timestamp, nonce),
+  });
+  const res = await fetch(`${API}/v1/repaint`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ owner: account.address, pixels, timestamp, nonce, signature }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.message ?? data.error ?? `repaint HTTP ${res.status}`);
+  return data;
+}
+
 // ---------- main loop ----------
 async function main() {
   const budgetMicro = BigInt(Math.round(MAX_SPEND_USDC * 1e6));
@@ -175,17 +207,25 @@ async function main() {
     if (batch.length > 0) {
       try {
         if (DRY_RUN) {
-          const q = await pw.quote(batch).catch(() => null);
-          log(`DRY frame ${frames} x=${x}${needDecayReset ? " [decay-reset]" : ""} cells=${batch.length}` +
-              (q ? ` quote=${q.totalUsdc ?? q.total ?? "?"}` : ""));
+          log(`DRY frame ${frames} x=${x}${needDecayReset ? " [decay-reset]" : ""} cells=${batch.length} (free repaint)`);
         } else {
-          const r = await pw.paint(batch, {
-            network: NETWORK,
-            maxTotal: 2_500_000n, // per-frame safety cap (2.5 USDC)
-            idempotencyKey: `pacman-${spend.runId}-${frames}`, // never double-pays a frame
-          });
-          gross += BigInt(r.totalPaid);
-          spend.grossMicro = gross.toString();
+          // v1.5.0: try the FREE repaint first — in HOLD mode every cell is
+          // ours, so this is the normal path and costs NOTHING. Fall back to
+          // a paid paint only if the free path refuses (e.g. a cell was
+          // conquered out from under us, or we're expanding onto new land).
+          try {
+            const batchHex = batch.map((p) => ({ x: p.x, y: p.y, color: typeof p.color === "string" ? p.color : `#${(p.color & 0xffffff).toString(16).padStart(6, "0")}` }));
+            await freeRepaint(batchHex);
+          } catch (freeErr) {
+            log(`free repaint refused (${(freeErr.message || freeErr).toString().slice(0, 80)}) — falling back to PAID paint`);
+            const r = await pw.paint(batch, {
+              network: NETWORK,
+              maxTotal: 2_500_000n, // per-frame safety cap (2.5 USDC)
+              idempotencyKey: `pacman-${spend.runId}-${frames}`, // never double-pays a frame
+            });
+            gross += BigInt(r.totalPaid);
+            spend.grossMicro = gross.toString();
+          }
         }
         if (needDecayReset) { lastDecayResetMs = now; spend.lastDecayResetMs = now; log(`decay-reset: refreshed ${batch.length} cells, clock reset`); }
         for (const [k, c] of target) cellsNow.set(k, c);
