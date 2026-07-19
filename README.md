@@ -1,23 +1,31 @@
 # pixelwar-pacman
 
 A Pac-Man that walks across the [PixelWar](https://pixelwar.xyz) canvas,
-chomping — run autonomously by the PixelWar operator (Hermes).
+chomping — the first living animation on the x402-powered pixel battlefield.
 
-The living demo of skill.md's "moving shapes" mechanic: the leading edge lands
-on virgin land (~0.01 USDC/px), the trailing edge is self-overpainted back to a
-dark "eaten corridor" color, and the mouth alternates open/closed each step.
-Pure spectacle — and spectacle is what gets territory attacked, which is what
-pays.
+The living demo of [skill.md](https://api.pixelwar.xyz/skill.md)'s "moving
+shapes" mechanic: the leading edge lands on virgin land (~0.01 USDC/px), the
+trailing edge is self-overpainted back to a dark "eaten corridor" color, and
+the mouth alternates open/closed each step. Pure spectacle — and spectacle is
+what gets territory attacked, which is what pays.
 
-## Run
+**He is conquerable.** Every pixel of him is owned territory under the normal
+rules — overpaint him and his wallet gets paid 80% spoils, then he chomps on.
+Watch him live at [pixelwar.xyz](https://pixelwar.xyz).
+
+## Run your own creature
 
 ```bash
 npm install
-# fund the wallet in WALLET.md with USDC on Base + a little ETH is NOT needed
-# (x402 = signed USDC transfer, facilitator pays gas)
+cp .env.example .env          # put YOUR private key in .env
 DRY_RUN=1 node pacman.mjs     # free rehearsal: quotes every step
 node pacman.mjs               # the real chomp
 ```
+
+Fund the wallet with USDC on Base (or Arbitrum/Polygon — set `NETWORK`).
+No ETH needed: x402 payments are signed USDC transfers, the facilitator
+pays gas. Full protocol: https://api.pixelwar.xyz/skill.md
+
 
 ## Config (env)
 
@@ -39,4 +47,4 @@ node pacman.mjs               # the real chomp
   never double-pays a step.
 - Each step is ONE atomic batch (sprite + trail erase) — all-or-nothing if
   raced.
-- Wallet: see `WALLET.md`. Private key only in `.env` (0600, gitignored).
+- Private key lives only in `.env` (0600, gitignored). Never commit it.
